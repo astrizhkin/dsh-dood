@@ -1,0 +1,4 @@
+[submodule "deepseek-harness-docker"]
+	path = deepseek-harness-docker
+	url = git@github.com:astrizhkin/deepseek-harness-docker.git
+	branch = main

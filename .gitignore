@@ -1,0 +1,12 @@
+# local machine config (paths, uid/gid) — .env.example is the tracked template
+.env
+
+# npm scratch in the agent workspace
+node_modules/
+package.json
+package-lock.json
+
+# runtime state dirs, if ever created inside the workspace
+dsh-data/
+dsh-guard/
+dsh-home/
