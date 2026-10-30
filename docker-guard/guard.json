@@ -1,0 +1,6 @@
+{
+  "allowedBindRoots": ["/root/dsh-workspace"],
+  "forceRuntime": null,
+  "maxMemoryBytes": 0,
+  "maxPids": 0
+}

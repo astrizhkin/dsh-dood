@@ -1,0 +1,123 @@
+# Guarded DSH stack — replaces launch-dsh-guarded.sh.
+#
+#   docker compose up -d          # start guard + agent
+#   docker compose down           # stop
+#   docker compose run --rm guard-test   # run the 42-assertion policy suite
+#
+# Configure via .env (see .env.example). All long-running containers run as
+# the invoking host user (DSH_UID:DSH_GID), so files the agent creates in
+# dsh-workspace / dsh-data are owned by that user, never root. The one-shot
+# `setup` service enforces that ownership (and refuses to start if dockerd
+# listens on TCP 2375/2376, which would bypass the guard entirely).
+
+name: dsh-guarded
+
+services:
+  # One-shot preflight: TCP-listener check + ownership fix. Only service
+  # that runs as root; touches no docker socket.
+  setup:
+    image: alpine:3.20
+    network_mode: host          # needed to read host /proc/net/tcp listeners
+    restart: "no"
+    volumes:
+      - ${DSH_DATA_DIR:?set in .env}:/mnt/dsh-data
+      - ${DSH_WORKSPACE_DIR:?set in .env}:/mnt/dsh-workspace
+      - ${DSH_GUARD_DIR:?set in .env}:/mnt/dsh-guard
+      - ${DSH_HOME_DIR:?set in .env}:/mnt/dsh-home
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if awk '$$4=="0A" && ($$2 ~ /:09(47|48)$$/)' /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q .; then
+          echo "ERROR: dockerd listens on TCP 2375/2376 — the guard would be bypassable." >&2
+          echo "Set daemon.json \"hosts\": [\"unix:///var/run/docker.sock\"] and restart dockerd." >&2
+          exit 1
+        fi
+        mkdir -p /mnt/dsh-guard/state /mnt/dsh-home
+        touch /mnt/dsh-data/.dsh-web.log
+        chown -R ${DSH_UID:?}:${DSH_GID:?} /mnt/dsh-data /mnt/dsh-workspace /mnt/dsh-guard /mnt/dsh-home
+        echo "preflight ok: no TCP listeners; data dirs owned by ${DSH_UID}:${DSH_GID}"
+
+  # The socket guard: no network of its own, all caps dropped, read-only
+  # rootfs, runs as the invoking user + the docker socket's group.
+  guard:
+    build:
+      context: ./docker-guard
+      target: runtime
+    image: dsh/docker-guard:latest
+    container_name: dsh-docker-guard
+    restart: unless-stopped
+    network_mode: none
+    user: "${DSH_UID}:${DSH_GID}"
+    group_add:
+      - "${DOCKER_GID:?set in .env: stat -c %g /var/run/docker.sock}"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges"]
+    read_only: true
+    environment:
+      GUARD_SOCKET: /run/guard/guard.sock
+      GUARD_STATE: /var/lib/guard/state.json
+      # absolute host path of the workspace; the guard's only allowed bind root
+      GUARD_ALLOWED_BIND_ROOTS: "${DSH_WORKSPACE_DIR}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DSH_GUARD_DIR}:/run/guard
+      - ${DSH_GUARD_DIR}/state:/var/lib/guard
+      # workspace at its true host path (ro) so realpath() checks resolve
+      - ${DSH_WORKSPACE_DIR}:${DSH_WORKSPACE_DIR}:ro
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  # The DSH agent. Bridge network (NOT host): only the web port is published.
+  # The workspace is mounted twice — at /root/dsh-workspace and at its true
+  # host path — so bind sources the agent passes to `docker -v` resolve to
+  # identical paths on the daemon side.
+  dsh:
+    build:
+      context: ./deepseek-harness-docker
+      args:
+        # variant prefix from deepseek-harness-docker/.build-variants
+        # (none | devtools-min | devtools | test | admin)
+        DEV_TOOLS: "${DSH_DEV_TOOLS:-none}"
+    image: ${DSH_IMAGE:-dsh:latest}
+    container_name: dsh-agent
+    user: "${DSH_UID}:${DSH_GID}"
+    environment:
+      DOCKER_HOST: unix:///var/run/dsh-guard/guard.sock
+      # the image has a `node` user at uid 1000 with home /home/node; Docker
+      # resolves the numeric user through /etc/passwd and sets HOME there,
+      # which would point dsh at an empty ~/.dsh. Force the real home and
+      # pin DSH_HOME explicitly (it overrides homedir() resolution).
+      HOME: /root
+      DSH_HOME: /root/.dsh
+      # entrypoint: dsh web listens on 127.0.0.1:3079 (internal), the proxy
+      # listens on 0.0.0.0:PROXY_PORT and is what gets published
+      PROXY_PORT: "${DSH_PUBLIC_PORT:-3080}"
+      # proxy's launch-token cache file; default /app/.dsh-launch-token is
+      # not writable for a non-root user, keep it in the dsh-data mount
+      DSH_TOKEN_FILE_AUTO: /root/.dsh/.dsh-launch-token
+    ports:
+      - "${DSH_PUBLIC_PORT:-3080}:${DSH_PUBLIC_PORT:-3080}"
+    volumes:
+      # /root in the image is 0700 root — a uid-1000 process cannot traverse
+      # it, so the mounts below it would be unreachable. Bind-mount a
+      # user-owned dir at /root itself; all paths stay identical.
+      - ${DSH_HOME_DIR}:/root
+      - ${DSH_DATA_DIR}:/root/.dsh
+      - ${DSH_WORKSPACE_DIR}:/root/dsh-workspace
+      - ${DSH_WORKSPACE_DIR}:${DSH_WORKSPACE_DIR}
+      - ${DSH_GUARD_DIR}:/var/run/dsh-guard
+      # /app is root-owned in the image; the entrypoint needs this one file
+      # writable (dsh log; the proxy also reads it for the launch token)
+      - ${DSH_DATA_DIR}/.dsh-web.log:/app/.dsh-web.log
+    depends_on:
+      - guard
+
+  # Policy suite (42 assertions) against the freshly compiled binary.
+  guard-test:
+    profiles: ["test"]
+    build:
+      context: ./docker-guard
+      target: test
